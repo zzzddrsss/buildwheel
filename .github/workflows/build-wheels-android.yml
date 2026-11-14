@@ -1,10 +1,10 @@
-name: Build xgboost wheel (Android arm64-v8a / Python 3.11) v8
+name: Build xgboost wheel (Android arm64-v8a / Python 3.11) v9
 # ============================================================
-# v8 修复：build-wheel.py 需要预先存在的 Python target 运行时包
-#          （maven/com/chaquo/python/target/<ver>/target-*-arm64-v8a.zip）。
-#          已验证 Maven Central 提供（target-3.11.17-0-arm64-v8a.zip, 6MB），
-#          构建前自动下载并放到 build-wheel.py 期望的目录。
-# 前情：v7 已用对入口（server/pypi/build-wheel.py）+ 官方 xgboost 1.7.3 配方。
+# v9 修复：新版 Python target 包（3.11.17）自带 libpython3.so，
+#          而 build-wheel.py L497 用 `ln -s`（无 -f）建同名链接时报
+#          "failed to create symbolic link ... File exists"。
+#          → 构建前用 sed 把 build-wheel.py 的 `ln -s ` 改为 `ln -sf `。
+# 前情：v8 已打通（源码下载/补丁/target 解压全部成功，仅卡在此处）。
 #
 # 产物：Artifacts → xgboost-android-arm64-v8a-cp311
 # 拿到 wheel 后：放 android/app/wheels/ + build.gradle 加 install "wheels/<文件名>"
@@ -42,7 +42,15 @@ jobs:
           ref: ${{ inputs.chaquopy_ref || 'master' }}
           path: chaquopy
           fetch-depth: 1
-      # ---------- 2. 下载 Python target 运行时（build-wheel.py 必需） ----------
+      # ---------- 2. 补丁：ln -s → ln -sf（新版 target 自带 libpython3.so） ----------
+      - name: Patch build-wheel.py (ln -s → ln -sf)
+        run: |
+          cd "$GITHUB_WORKSPACE/chaquopy/server/pypi"
+          grep -n "ln -s " build-wheel.py || true
+          sed -i 's/ln -s /ln -sf /' build-wheel.py
+          echo "补丁后："
+          grep -n "ln -sf " build-wheel.py
+      # ---------- 3. 下载 Python target 运行时 ----------
       - name: Download Python target from Maven Central
         env:
           TV: ${{ inputs.target_version || '3.11.17-0' }}
@@ -53,41 +61,41 @@ jobs:
           echo "下载: $URL"
           curl -fSL --retry 3 -o "$DEST/target-$TV-arm64-v8a.zip" "$URL"
           ls -lh "$DEST"
-      # ---------- 3. 环境确认 ----------
+      # ---------- 4. 环境确认 ----------
       - name: Check environment
         run: |
           python3 --version
           ls "$ANDROID_HOME/ndk"
-      # ---------- 4. 选定 NDK ----------
+      # ---------- 5. 选定 NDK ----------
       - name: Pick NDK version
         id: ndk
         run: |
           LATEST=$(ls -v "$ANDROID_HOME/ndk" 2>/dev/null | tail -n1)
           echo "ndk=$ANDROID_HOME/ndk/$LATEST" >> "$GITHUB_OUTPUT"
           echo "使用 NDK: $LATEST"
-      # ---------- 5. 基础依赖 ----------
+      # ---------- 6. 基础依赖 ----------
       - name: Install prerequisites
         run: |
           sudo apt-get update
           sudo apt-get install -y ccache build-essential
-      # ---------- 6. JDK 17 ----------
+      # ---------- 7. JDK 17 ----------
       - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-      # ---------- 7. Python 3.11 ----------
+      # ---------- 8. Python 3.11 ----------
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      # ---------- 8. build-wheel.py 依赖 ----------
+      # ---------- 9. build-wheel.py 依赖 ----------
       - name: Install build-wheel requirements
         run: |
           cd "$GITHUB_WORKSPACE/chaquopy/server/pypi"
           python3 -m pip install -r requirements.txt
           python3 -c "import build, elftools, jinja2, jsonschema, pypi_simple, yaml; print('依赖 OK')"
-      # ---------- 9. 交叉编译 xgboost 1.7.3 ----------
+      # ---------- 10. 交叉编译 xgboost 1.7.3 ----------
       - name: Build xgboost wheel (arm64-v8a, py3.11)
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk }}
@@ -95,7 +103,7 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE/chaquopy/server/pypi"
           python3 build-wheel.py --abi arm64-v8a --python 3.11 xgboost
-      # ---------- 10. 收集 wheel ----------
+      # ---------- 11. 收集 wheel ----------
       - name: Collect target wheel
         run: |
           mkdir -p "$GITHUB_WORKSPACE/wheelhouse"
@@ -107,7 +115,7 @@ jobs:
           fi
           cp -v "$WH" "$GITHUB_WORKSPACE/wheelhouse/"
           ls -lh "$GITHUB_WORKSPACE/wheelhouse"
-      # ---------- 11. 上传产物 ----------
+      # ---------- 12. 上传产物 ----------
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
@@ -116,17 +124,17 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
-      # ---------- 12. 构建摘要 ----------
+      # ---------- 13. 构建摘要 ----------
       - name: Build summary
         if: always()
         run: |
           {
-            echo "### xgboost Android wheel 构建摘要（v8 target 下载版）"
+            echo "### xgboost Android wheel 构建摘要（v9 ln -sf 补丁版）"
             echo ""
             echo "| 项目 | 值 |"
             echo "| --- | --- |"
             echo "| 源码仓库 | chaquo/chaquopy@master |"
-            echo "| 构建入口 | server/pypi/build-wheel.py |"
+            echo "| 构建入口 | server/pypi/build-wheel.py（已打 ln -sf 补丁）|"
             echo "| 配方 | packages/xgboost（1.7.3）|"
             echo "| Python target | ${{ inputs.target_version || '3.11.17-0' }}（Maven Central）|"
             echo "| 目标平台 | android_24_arm64_v8a |"
