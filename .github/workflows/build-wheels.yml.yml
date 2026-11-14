@@ -77,7 +77,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: false
-          cache: 'pip'
+          # 注意：不启用 cache: 'pip'——该功能要求仓库存在
+          # requirements.txt / pyproject.toml，否则会报错
       - name: Show Python & pip version
         run: |
           python --version
