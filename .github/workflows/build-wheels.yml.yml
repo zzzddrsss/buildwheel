@@ -128,8 +128,9 @@ jobs:
           SKL_INPUT: ${{ inputs.sklearn_version }}
         run: |
           set -euo pipefail
-          XGB_VER="${XGB_INPUT:-$(python scripts/resolve_version.py xgboost)}"
-          SKL_VER="${SKL_INPUT:-$(python scripts/resolve_version.py scikit-learn)}"
+          # --python：过滤掉要求更高 Python 版本的发布版（如 xgboost 3.4.x 要求 >=3.12）
+          XGB_VER="${XGB_INPUT:-$(python scripts/resolve_version.py xgboost --python "${{ matrix.python-version }}")}"
+          SKL_VER="${SKL_INPUT:-$(python scripts/resolve_version.py scikit-learn --python "${{ matrix.python-version }}")}"
           echo "xgboost=${XGB_VER}" >> "$GITHUB_OUTPUT"
           echo "scikit-learn=${SKL_VER}" >> "$GITHUB_OUTPUT"
           echo "解析结果 -> xgboost=${XGB_VER}, scikit-learn=${SKL_VER}"
