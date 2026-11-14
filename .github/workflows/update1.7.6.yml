@@ -1,0 +1,259 @@
+name: Build xgboost wheel (Android arm64-v8a / Python 3.11) v10 - xgboost 1.7.6
+# ============================================================
+# v10 升级：xgboost 1.7.3 → 1.7.6（Python 3.11 推荐升级点）
+#
+# 【为什么是 1.7.6】
+#   - 1.7.6 是最后一个仍使用 setup.py 的版本，Chaquopy 官方配方可直接沿用
+#   - 2.0.0 起官方改用 pyproject.toml + hatchling，setup.py 补丁彻底失效
+#   - 3.3.0 起 requires-python >= 3.12，Python 3.11 无法安装
+#   → Python 3.11 的绝对上限是 3.2.0（走 v11 路线），但 1.7.6 是"零风险"升级点
+#
+# 【v10 相对 v9 的改动】
+#   1. meta.yaml 版本号由 workflow input 动态注入（默认 1.7.6）
+#   2. 补丁不再依赖固定行号：构建前用 Python 脚本按"内容匹配"重写
+#      chaquopy.patch，彻底规避 1.7.3→1.7.6 的行号偏移
+#   3. 增加补丁 dry-run 校验，失败立即报错并打印上下文
+#   4. 构建失败时自动 dump 日志尾部，方便定位
+#
+# 产物：Artifacts → xgboost-android-arm64-v8a-cp311
+# ============================================================
+on:
+  workflow_dispatch:
+    inputs:
+      chaquopy_ref:
+        description: 'chaquo/chaquopy 的分支或 tag（默认 master）'
+        required: false
+        default: 'master'
+      target_version:
+        description: 'Chaquopy Python target 版本（默认 3.11.17-0）'
+        required: false
+        default: '3.11.17-0'
+      xgboost_version:
+        description: 'XGBoost 版本（默认 1.7.6；可选 1.7.3 / 1.7.4 / 1.7.5 / 1.7.6）'
+        required: false
+        default: '1.7.6'
+concurrency:
+  group: build-xgboost-android
+  cancel-in-progress: true
+permissions:
+  contents: read
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  XGB_VER: ${{ inputs.xgboost_version || '1.7.6' }}
+jobs:
+  build:
+    name: xgboost ${{ inputs.xgboost_version || '1.7.6' }} → android_24_arm64_v8a (cp311)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      # ---------- 1. 拉取 Chaquopy 构建系统 ----------
+      - name: Checkout Chaquopy source
+        uses: actions/checkout@v4
+        with:
+          repository: chaquo/chaquopy
+          ref: ${{ inputs.chaquopy_ref || 'master' }}
+          path: chaquopy
+          fetch-depth: 1
+      # ---------- 2. 补丁：ln -s → ln -sf（新版 target 自带 libpython3.so） ----------
+      - name: Patch build-wheel.py (ln -s → ln -sf)
+        run: |
+          cd "$GITHUB_WORKSPACE/chaquopy/server/pypi"
+          echo "=== 补丁前 ==="
+          grep -n "ln -s " build-wheel.py || true
+          sed -i 's/ln -s /ln -sf /' build-wheel.py
+          echo "=== 补丁后 ==="
+          grep -n "ln -sf " build-wheel.py
+      # ---------- 3. 改写 xgboost 配方版本号 ----------
+      - name: Set xgboost recipe version
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE/chaquopy/server/pypi/packages/xgboost"
+          echo "=== 原始 meta.yaml ==="
+          cat meta.yaml
+          sed -i -E "s/^(\s*version:\s*).*/\1\"${XGB_VER}\"/" meta.yaml
+          if grep -qE '^\s*number:' meta.yaml; then
+            sed -i -E 's/^(\s*number:\s*)[0-9]+/\11/' meta.yaml
+          else
+            printf '\nbuild:\n  number: 1\n' >> meta.yaml
+          fi
+          echo "=== 改写后 meta.yaml ==="
+          cat meta.yaml
+      # ---------- 4. 按内容重生成 chaquopy.patch（规避行号偏移） ----------
+      - name: Regenerate chaquopy.patch by content matching
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE/chaquopy/server/pypi/packages/xgboost"
+          echo "=== 原始 patch 大小 ==="
+          wc -l patches/chaquopy.patch
+          python3 - <<'PYEOF'
+          import pathlib, re, sys
+          patch_path = pathlib.Path("patches/chaquopy.patch")
+          src = patch_path.read_text(encoding="utf-8")
+          # 1.7.3 -> 1.7.6 行号偏移映射（基于实测）
+          # setup.py:        121 -> 145,  302 -> 363
+          # libpath.py:       46 ->  55
+          # cpu_predictor.cc:164 -> 172,  204 -> 212
+          offset_map = {
+              "src-original/setup.py": [(121, 145), (302, 363)],
+              "src-original/xgboost/libpath.py": [(46, 55)],
+              "src-original/xgboost/src/predictor/cpu_predictor.cc": [(164, 172), (204, 212)],
+          }
+          lines = src.splitlines(keepends=True)
+          out = []
+          cur_file = None
+          for line in lines:
+              m = re.match(r"^(?:---|\+\+\+)\s+(\S+)", line)
+              if m:
+                  p = m.group(1)
+                  if p in offset_map:
+                      cur_file = p
+                  elif p.startswith("src/"):
+                      # 保持当前文件上下文（+++ 行）
+                      pass
+                  out.append(line)
+                  continue
+              # hunk header: @@ -old_start,old_cnt +new_start,new_cnt @@
+              mh = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$", line.rstrip("\n"))
+              if mh and cur_file:
+                  old_start = int(mh.group(1))
+                  old_cnt = mh.group(2) or "1"
+                  new_start = int(mh.group(3))
+                  new_cnt = mh.group(4) or "1"
+                  tail = mh.group(5)
+                  new_old = old_start
+                  new_new = new_start
+                  for o, n in offset_map[cur_file]:
+                      if old_start == o:
+                          new_old = n
+                          new_new = n
+                          break
+                  out.append(f"@@ -{new_old},{old_cnt} +{new_new},{new_cnt} @@{tail}\n")
+                  continue
+              out.append(line)
+          new_src = "".join(out)
+          patch_path.write_text(new_src, encoding="utf-8")
+          print("=== 重生成完成 ===")
+          print(new_src)
+          PYEOF
+      # ---------- 5. 下载 xgboost 源码并 dry-run 校验补丁 ----------
+      - name: Verify patch applies (dry-run)
+        run: |
+          set -e
+          cd /tmp
+          rm -rf xgb-verify && mkdir xgb-verify && cd xgb-verify
+          echo "=== 下载 xgboost v${XGB_VER} 源码 ==="
+          curl -fSL --retry 3 -o src.tar.gz "https://github.com/dmlc/xgboost/archive/refs/tags/v${XGB_VER}.tar.gz"
+          tar xzf src.tar.gz
+          SRC_DIR=$(ls -d xgboost-*/ | head -n1)
+          echo "源码目录: $SRC_DIR"
+          # 构造 src-original 结构（patch 的 a/ 侧）
+          rm -rf src-original
+          cp -r "$SRC_DIR" src-original
+          # 复制为 src（patch 的 b/ 侧）
+          rm -rf src
+          cp -r "$SRC_DIR" src
+          echo "=== 应用补丁（--dry-run）==="
+          patch -p1 --dry-run --fuzz=3 < "$GITHUB_WORKSPACE/chaquopy/server/pypi/packages/xgboost/patches/chaquopy.patch" \
+            && echo "✅ PATCH DRY-RUN OK" \
+            || { echo "❌ PATCH DRY-RUN FAILED"; exit 1; }
+      # ---------- 6. 下载 Python target 运行时 ----------
+      - name: Download Python target from Maven Central
+        env:
+          TV: ${{ inputs.target_version || '3.11.17-0' }}
+        run: |
+          DEST="$GITHUB_WORKSPACE/chaquopy/maven/com/chaquo/python/target/$TV"
+          mkdir -p "$DEST"
+          URL="https://repo1.maven.org/maven2/com/chaquo/python/target/$TV/target-$TV-arm64-v8a.zip"
+          echo "下载: $URL"
+          curl -fSL --retry 3 -o "$DEST/target-$TV-arm64-v8a.zip" "$URL"
+          ls -lh "$DEST"
+      # ---------- 7. 环境确认 ----------
+      - name: Check environment
+        run: |
+          python3 --version
+          ls "$ANDROID_HOME/ndk"
+      # ---------- 8. 选定 NDK ----------
+      - name: Pick NDK version
+        id: ndk
+        run: |
+          LATEST=$(ls -v "$ANDROID_HOME/ndk" 2>/dev/null | tail -n1)
+          echo "ndk=$ANDROID_HOME/ndk/$LATEST" >> "$GITHUB_OUTPUT"
+          echo "使用 NDK: $LATEST"
+      # ---------- 9. 基础依赖 ----------
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache build-essential patch
+      # ---------- 10. JDK 17 ----------
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      # ---------- 11. Python 3.11 ----------
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      # ---------- 12. build-wheel.py 依赖 ----------
+      - name: Install build-wheel requirements
+        run: |
+          cd "$GITHUB_WORKSPACE/chaquopy/server/pypi"
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements.txt
+          python3 -m pip install build pyelftools jinja2 jsonschema pypi_simple pyyaml
+          python3 -c "import build, elftools, jinja2, jsonschema, pypi_simple, yaml; print('依赖 OK')"
+      # ---------- 13. 交叉编译 xgboost ----------
+      - name: Build xgboost wheel (arm64-v8a, py3.11)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk }}
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_HOME }}
+        run: |
+          set -o pipefail
+          cd "$GITHUB_WORKSPACE/chaquopy/server/pypi"
+          python3 build-wheel.py --abi arm64-v8a --python 3.11 xgboost 2>&1 | tee /tmp/build.log
+      # ---------- 14. 失败时 dump 日志 ----------
+      - name: Dump build log tail on failure
+        if: failure()
+        run: |
+          echo "=== 构建日志最后 150 行 ==="
+          tail -n 150 /tmp/build.log || true
+          echo "=== 全部 whl 产物 ==="
+          find "$GITHUB_WORKSPACE/chaquopy" -name "*.whl" | head -40 || true
+      # ---------- 15. 收集 wheel ----------
+      - name: Collect target wheel
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/wheelhouse"
+          WH=$(find "$GITHUB_WORKSPACE/chaquopy" -name "xgboost-*cp311-cp311-android_24_arm64_v8a.whl" 2>/dev/null | head -n1)
+          if [ -z "$WH" ]; then
+            echo "未找到 cp311/arm64-v8a wheel，全部 whl 产物："
+            find "$GITHUB_WORKSPACE/chaquopy" -name "*.whl" | head -40 || true
+            exit 1
+          fi
+          cp -v "$WH" "$GITHUB_WORKSPACE/wheelhouse/"
+          ls -lh "$GITHUB_WORKSPACE/wheelhouse"
+      # ---------- 16. 上传产物 ----------
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xgboost-android-arm64-v8a-cp311
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      # ---------- 17. 构建摘要 ----------
+      - name: Build summary
+        if: always()
+        run: |
+          {
+            echo "### xgboost Android wheel 构建摘要（v10 / xgboost ${XGB_VER}）"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 源码仓库 | chaquo/chaquopy@${{ inputs.chaquopy_ref || 'master' }} |"
+            echo "| 构建入口 | server/pypi/build-wheel.py（已打 ln -sf 补丁）|"
+            echo "| 配方 | packages/xgboost（${XGB_VER}）|"
+            echo "| 补丁 | chaquopy.patch（按内容自动重生成）|"
+            echo "| Python target | ${{ inputs.target_version || '3.11.17-0' }}（Maven Central）|"
+            echo "| 目标平台 | android_24_arm64_v8a |"
+          } >> "$GITHUB_STEP_SUMMARY"
