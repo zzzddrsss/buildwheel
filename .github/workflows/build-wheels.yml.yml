@@ -173,9 +173,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install numpy scipy joblib threadpoolctl
-          python -m pip install --no-index --find-links wheelhouse \
-            scikit-learn xgboost --no-deps
+          # 自动解析 wheel 声明的依赖并安装，避免遗漏新增依赖（如 narwhals）
+          python scripts/install_wheels.py wheelhouse
           python scripts/smoke_test.py
       # ---------- 12. 上传 wheel 产物 ----------
       - name: Upload wheels artifact
