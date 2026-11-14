@@ -1,11 +1,11 @@
-name: Build xgboost & scikit-learn Wheels (Python 3.11)
+name: Build xgboost & scikit-learn Wheels (Linux / Python 3.11)
 # ============================================================
 # 用途：在 Python 3.11 环境下，从源码构建 xgboost 与 scikit-learn
-#      的 .whl 安装包，并上传为 GitHub Actions 产物（Artifact）。
+#      的 Linux x86_64 .whl 安装包，并上传为 GitHub Actions 产物。
 #
 # 触发方式：
 #   1. 手动触发（workflow_dispatch）—— 推荐，可自定义版本号
-#   2. push 到 main/master 分支且改动了本文件
+#   2. push 到 main/master 分支且改动了本文件或 scripts/
 #   3. 每周一 03:00 UTC 定时构建（默认注释，需要时取消注释）
 # ============================================================
 on:
@@ -17,20 +17,15 @@ on:
         default: '3.11'
         type: string
       xgboost_version:
-        description: 'xgboost 版本（留空则取 PyPI 最新版）'
+        description: 'xgboost 版本（留空则取兼容目标 Python 的最新版）'
         required: false
         default: ''
         type: string
       sklearn_version:
-        description: 'scikit-learn 版本（留空则取 PyPI 最新版）'
+        description: 'scikit-learn 版本（留空则取兼容目标 Python 的最新版）'
         required: false
         default: ''
         type: string
-      upload_artifact:
-        description: '是否上传 whl 为产物'
-        required: false
-        default: true
-        type: boolean
   push:
     branches: [ main, master ]
     paths:
@@ -49,36 +44,24 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 jobs:
   # ==========================================================
-  # Job 1：构建 scikit-learn 与 xgboost 的 wheel
-  # 矩阵覆盖三大操作系统的 x86_64 / arm64 平台
+  # 单 Job：构建 Linux x86_64 的 scikit-learn 与 xgboost wheel
   # ==========================================================
   build:
-    name: Build wheels on ${{ matrix.os }} (py${{ matrix.python-version }})
-    runs-on: ${{ matrix.os }}
+    name: Build wheels on Linux (py${{ inputs.python_version || '3.11' }})
+    runs-on: ubuntu-22.04
     timeout-minutes: 90
-    strategy:
-      # 某个平台失败不影响其它平台继续构建
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-22.04
-          - windows-2022
-          - macos-13        # Intel x86_64
-          - macos-14        # Apple Silicon arm64
-        python-version:
-          - ${{ inputs.python_version || '3.11' }}
     steps:
       # ---------- 1. 拉取代码 ----------
       - name: Checkout repository
         uses: actions/checkout@v4
       # ---------- 2. 安装 Python ----------
-      - name: Set up Python ${{ matrix.python-version }}
+      # 注意：不启用 cache: 'pip'——该功能要求仓库存在
+      # requirements.txt / pyproject.toml，否则会报错
+      - name: Set up Python ${{ inputs.python_version || '3.11' }}
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ inputs.python_version || '3.11' }}
           allow-prereleases: false
-          # 注意：不启用 cache: 'pip'——该功能要求仓库存在
-          # requirements.txt / pyproject.toml，否则会报错
       - name: Show Python & pip version
         run: |
           python --version
@@ -91,7 +74,6 @@ jobs:
       # ---------- 4. Linux 系统级编译依赖 ----------
       # xgboost 需要 OpenMP 运行时（libgomp），scikit-learn 需要 BLAS/LAPACK
       - name: Install Linux system dependencies
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -103,38 +85,23 @@ jobs:
             liblapack-dev \
             gfortran \
             pkg-config
-      # ---------- 5. macOS 系统级编译依赖 ----------
-      - name: Install macOS system dependencies
-        if: runner.os == 'macOS'
-        run: |
-          brew update || true
-          brew install libomp cmake ninja openblas || true
-          echo "CPATH=$(brew --prefix libomp)/include" >> "$GITHUB_ENV"
-          echo "LIBRARY_PATH=$(brew --prefix libomp)/lib" >> "$GITHUB_ENV"
-          echo "LDFLAGS=-L$(brew --prefix libomp)/lib" >> "$GITHUB_ENV"
-          echo "CPPFLAGS=-I$(brew --prefix libomp)/include" >> "$GITHUB_ENV"
-      # ---------- 6. Windows 工具链确认 ----------
-      # windows-2022 运行器自带 MSVC 与 CMake，无需额外安装
-      - name: Check Windows toolchain
-        if: runner.os == 'Windows'
-        run: |
-          cmake --version
-      # ---------- 7. 解析目标版本号 ----------
+      # ---------- 5. 解析目标版本号 ----------
       - name: Resolve target versions
         id: versions
         shell: bash
         env:
           XGB_INPUT: ${{ inputs.xgboost_version }}
           SKL_INPUT: ${{ inputs.sklearn_version }}
+          PY_VER: ${{ inputs.python_version || '3.11' }}
         run: |
           set -euo pipefail
           # --python：过滤掉要求更高 Python 版本的发布版（如 xgboost 3.4.x 要求 >=3.12）
-          XGB_VER="${XGB_INPUT:-$(python scripts/resolve_version.py xgboost --python "${{ matrix.python-version }}")}"
-          SKL_VER="${SKL_INPUT:-$(python scripts/resolve_version.py scikit-learn --python "${{ matrix.python-version }}")}"
+          XGB_VER="${XGB_INPUT:-$(python scripts/resolve_version.py xgboost --python "${PY_VER}")}"
+          SKL_VER="${SKL_INPUT:-$(python scripts/resolve_version.py scikit-learn --python "${PY_VER}")}"
           echo "xgboost=${XGB_VER}" >> "$GITHUB_OUTPUT"
           echo "scikit-learn=${SKL_VER}" >> "$GITHUB_OUTPUT"
           echo "解析结果 -> xgboost=${XGB_VER}, scikit-learn=${SKL_VER}"
-      # ---------- 8. 从源码构建 scikit-learn wheel ----------
+      # ---------- 6. 从源码构建 scikit-learn wheel ----------
       - name: Build scikit-learn wheel
         shell: bash
         env:
@@ -147,7 +114,7 @@ jobs:
             --no-build-isolation \
             --wheel-dir wheelhouse
           ls -lh wheelhouse
-      # ---------- 9. 从源码构建 xgboost wheel ----------
+      # ---------- 7. 从源码构建 xgboost wheel ----------
       - name: Build xgboost wheel
         shell: bash
         env:
@@ -160,15 +127,15 @@ jobs:
             --no-build-isolation \
             --wheel-dir wheelhouse
           ls -lh wheelhouse
-      # ---------- 10. 校验产物 ----------
+      # ---------- 8. 校验产物 ----------
       - name: Verify wheels
         shell: bash
         run: |
           set -euo pipefail
           python scripts/verify_wheels.py wheelhouse \
             --expect 2 \
-            --python "${{ matrix.python-version }}"
-      # ---------- 11. 冒烟测试：本地安装并 import ----------
+            --python "${{ inputs.python_version || '3.11' }}"
+      # ---------- 9. 冒烟测试：本地安装并 import ----------
       - name: Smoke test (install & import)
         shell: bash
         run: |
@@ -176,23 +143,22 @@ jobs:
           # 自动解析 wheel 声明的依赖并安装，避免遗漏新增依赖（如 narwhals）
           python scripts/install_wheels.py wheelhouse
           python scripts/smoke_test.py
-      # ---------- 12. 上传 wheel 产物 ----------
+      # ---------- 10. 上传 wheel 产物 ----------
       - name: Upload wheels artifact
-        if: ${{ inputs.upload_artifact != false }}
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ runner.os }}-${{ runner.arch }}-py${{ matrix.python-version }}
+          name: wheels-linux-x86_64-py${{ inputs.python_version || '3.11' }}
           path: wheelhouse/*.whl
           if-no-files-found: error
           retention-days: 30
           compression-level: 0   # whl 本身已压缩，避免二次压缩浪费 CPU
-      # ---------- 13. 打印构建摘要 ----------
+      # ---------- 11. 打印构建摘要 ----------
       - name: Build summary
         if: always()
         shell: bash
         run: |
           {
-            echo "### 构建摘要 — ${{ runner.os }} / ${{ runner.arch }} / py${{ matrix.python-version }}"
+            echo "### 构建摘要 — Linux x86_64 / py${{ inputs.python_version || '3.11' }}"
             echo ""
             echo "| 项目 | 版本 |"
             echo "| --- | --- |"
@@ -204,31 +170,3 @@ jobs:
             ls -lh wheelhouse 2>/dev/null || echo "无产物"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-  # ==========================================================
-  # Job 2：汇总所有平台的产物，方便一次性下载
-  # ==========================================================
-  collect:
-    name: Collect all wheels
-    needs: build
-    if: ${{ always() && inputs.upload_artifact != false }}
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: all-wheels
-          pattern: wheels-*
-          merge-multiple: true
-      - name: List collected wheels
-        run: |
-          echo "=== 汇总产物 ==="
-          ls -lh all-wheels || true
-          echo "文件数: $(ls -1 all-wheels/*.whl 2>/dev/null | wc -l)"
-      - name: Upload merged artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-all-platforms-py3.11
-          path: all-wheels/*.whl
-          if-no-files-found: warn
-          retention-days: 30
-          compression-level: 0
