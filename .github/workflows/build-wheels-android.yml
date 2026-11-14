@@ -1,8 +1,8 @@
-name: Build xgboost wheel (Android arm64-v8a / Python 3.11) v5
+name: Build xgboost wheel (Android arm64-v8a / Python 3.11) v6
 # ============================================================
-# v5 修复：仓库地址错误 → 正确地址是 chaquo/chaquopy（组织名 chaquo，无 y），
-#          默认分支 master（无 15.0 分支）。已通过 GitHub API 实测验证 200 OK。
-# 其余与 v4 相同：单目标 cp311 + arm64-v8a，约 20~40 分钟。
+# v6 修复：master 分支目录结构已重构，server/pip 不存在 →
+#          自动搜索 build.py 真实位置（find），不再写死路径。
+# 前情：v5 已解决仓库地址（chaquo/chaquopy@master，checkout 成功）。
 #
 # 产物：Artifacts → xgboost-android-arm64-v8a-cp311
 # 拿到 wheel 后：放 android/app/wheels/ + build.gradle 加 install "wheels/<文件名>"
@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     steps:
-      # ---------- 1. 拉取 Chaquopy 构建系统（正确地址：chaquo/chaquopy） ----------
+      # ---------- 1. 拉取 Chaquopy 构建系统 ----------
       - name: Checkout Chaquopy source
         uses: actions/checkout@v4
         with:
@@ -40,18 +40,30 @@ jobs:
           ref: ${{ inputs.chaquopy_ref || 'master' }}
           path: chaquopy
           fetch-depth: 1
-      - name: Show Chaquopy version
+      # ---------- 2. 定位 build.py（目录结构自适应） ----------
+      - name: Locate build.py
+        id: locate
         run: |
           cd "$GITHUB_WORKSPACE/chaquopy"
-          git log -1 --oneline
-          git branch --show-current
-      # ---------- 2. 环境确认 ----------
+          echo "仓库顶层结构："
+          ls -la
+          BP=$(find . -name "build.py" -not -path "*/node_modules/*" 2>/dev/null | head -n1)
+          if [ -z "$BP" ]; then
+            echo "::error::仓库内未找到 build.py"
+            echo "全部 py 文件（前 40 个）："
+            find . -name "*.py" -maxdepth 3 | head -40
+            exit 1
+          fi
+          BP_DIR=$(dirname "$BP")
+          echo "找到 build.py: $BP"
+          echo "bpdir=$GITHUB_WORKSPACE/chaquopy/$BP_DIR" >> "$GITHUB_OUTPUT"
+      # ---------- 3. 环境确认 ----------
       - name: Check environment
         run: |
           python3 --version
           echo "ANDROID_HOME=$ANDROID_HOME"
-          ls "$ANDROID_HOME/ndk" || echo "no preinstalled NDK"
-      # ---------- 3. 选定 NDK ----------
+          ls "$ANDROID_HOME/ndk"
+      # ---------- 4. 选定 NDK ----------
       - name: Pick NDK version
         id: ndk
         run: |
@@ -62,27 +74,27 @@ jobs:
           fi
           echo "ndk=$ANDROID_HOME/ndk/$LATEST" >> "$GITHUB_OUTPUT"
           echo "使用 NDK: $LATEST"
-      # ---------- 4. 基础依赖 ----------
+      # ---------- 5. 基础依赖 ----------
       - name: Install prerequisites
         run: |
           sudo apt-get update
           sudo apt-get install -y ccache build-essential
-      # ---------- 5. JDK 17 ----------
+      # ---------- 6. JDK 17 ----------
       - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-      # ---------- 6. Python 3.11 ----------
+      # ---------- 7. Python 3.11 ----------
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      # ---------- 7. build.py 单目标参数探测 ----------
-      - name: Detect build.py single-target flags
+      # ---------- 8. build.py 参数探测 ----------
+      - name: Detect build.py flags
         id: flags
         run: |
-          cd "$GITHUB_WORKSPACE/chaquopy/server/pip"
+          cd "${{ steps.locate.outputs.bpdir }}"
           python3 build.py --help 2>&1 | tee build_help.txt || true
           if grep -q -- "--python-version" build_help.txt; then
             PYFLAG="--python-version"; ABIFLAG="--abi"
@@ -94,13 +106,13 @@ jobs:
           echo "pyflag=$PYFLAG" >> "$GITHUB_OUTPUT"
           echo "abiflag=$ABIFLAG" >> "$GITHUB_OUTPUT"
           echo "探测结果: PYFLAG='$PYFLAG' ABIFLAG='$ABIFLAG'"
-      # ---------- 8. 交叉编译 xgboost（仅 cp311 + arm64-v8a） ----------
+      # ---------- 9. 交叉编译 xgboost（仅 cp311 + arm64-v8a） ----------
       - name: Build xgboost wheel (cp311 + arm64-v8a only)
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk }}
           ANDROID_SDK_ROOT: ${{ env.ANDROID_HOME }}
         run: |
-          cd "$GITHUB_WORKSPACE/chaquopy/server/pip"
+          cd "${{ steps.locate.outputs.bpdir }}"
           if [ -f requirements.txt ]; then
             python3 -m pip install -r requirements.txt || true
           fi
@@ -115,19 +127,19 @@ jobs:
             echo "::warning::build.py 未识别出单目标参数，回退全量构建（会较慢）"
             python3 build.py "${SPEC}"
           fi
-      # ---------- 9. 挑出目标 wheel ----------
+      # ---------- 10. 收集 wheel（位置自适应） ----------
       - name: Collect target wheel
         run: |
           mkdir -p "$GITHUB_WORKSPACE/wheelhouse"
-          WH=$(ls "$GITHUB_WORKSPACE/chaquopy/server/pip/wheelhouse/"xgboost-*cp311-cp311-android_24_arm64_v8a.whl 2>/dev/null | head -n1)
+          WH=$(find "$GITHUB_WORKSPACE/chaquopy" -name "xgboost-*cp311-cp311-android_24_arm64_v8a.whl" 2>/dev/null | head -n1)
           if [ -z "$WH" ]; then
-            echo "未找到 cp311/arm64-v8a wheel，全部产物："
-            ls -lh "$GITHUB_WORKSPACE/chaquopy/server/pip/wheelhouse" 2>/dev/null || true
+            echo "未找到 cp311/arm64-v8a wheel，全部 whl 产物："
+            find "$GITHUB_WORKSPACE/chaquopy" -name "*.whl" | head -40 || true
             exit 1
           fi
           cp -v "$WH" "$GITHUB_WORKSPACE/wheelhouse/"
           ls -lh "$GITHUB_WORKSPACE/wheelhouse"
-      # ---------- 10. 上传产物 ----------
+      # ---------- 11. 上传产物 ----------
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
@@ -136,22 +148,18 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           compression-level: 0
-      # ---------- 11. 构建摘要 ----------
+      # ---------- 12. 构建摘要 ----------
       - name: Build summary
         if: always()
         run: |
           {
-            echo "### xgboost Android wheel 构建摘要（v5 仓库地址修正版）"
+            echo "### xgboost Android wheel 构建摘要（v6 目录自适应版）"
             echo ""
             echo "| 项目 | 值 |"
             echo "| --- | --- |"
             echo "| 源码仓库 | chaquo/chaquopy@master |"
+            echo "| build.py | ${{ steps.locate.outputs.bpdir }}/build.py |"
             echo "| 目标平台 | android_24_arm64_v8a |"
             echo "| Python | 3.11 (cp311) |"
             echo "| xgboost | ${{ inputs.xgboost_version || 'latest' }} |"
-            echo ""
-            echo "**全部产物：**"
-            echo '```'
-            ls -lh "$GITHUB_WORKSPACE/chaquopy/server/pip/wheelhouse" 2>/dev/null || echo "无产物"
-            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
