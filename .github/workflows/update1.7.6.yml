@@ -1,19 +1,17 @@
-name: Build xgboost wheel (Android arm64-v8a / Python 3.11) v10 - xgboost 1.7.6
+name: Build xgboost wheel (Android arm64-v8a / Python 3.11) v10c - xgboost 1.7.6
 # ============================================================
-# v10 升级：xgboost 1.7.3 → 1.7.6（Python 3.11 推荐升级点）
-#
-# 【为什么是 1.7.6】
-#   - 1.7.6 是最后一个仍使用 setup.py 的版本，Chaquopy 官方配方可直接沿用
-#   - 2.0.0 起官方改用 pyproject.toml + hatchling，setup.py 补丁彻底失效
-#   - 3.3.0 起 requires-python >= 3.12，Python 3.11 无法安装
-#   → Python 3.11 的绝对上限是 3.2.0（走 v11 路线），但 1.7.6 是"零风险"升级点
-#
-# 【v10 相对 v9 的改动】
-#   1. meta.yaml 版本号由 workflow input 动态注入（默认 1.7.6）
-#   2. 补丁不再依赖固定行号：构建前用 Python 脚本按"内容匹配"重写
-#      chaquopy.patch，彻底规避 1.7.3→1.7.6 的行号偏移
-#   3. 增加补丁 dry-run 校验，失败立即报错并打印上下文
-#   4. 构建失败时自动 dump 日志尾部，方便定位
+# v10c 修复（基于 v10 实际失败日志）：
+#   问题1：v10 的 dry-run 校验用了 GitHub 源码包 + 错误目录结构，
+#          而 Chaquopy 实际编译用的是 PyPI sdist（两者结构不同）
+#   问题2：heredoc + sed 去缩进写补丁的方式在 YAML 块中容易错位
+#   修复：
+#   1. 补丁完全重写：以 PyPI sdist（xgboost-1.7.6.tar.gz）真实内容为基准，
+#      5 个 hunk 全部通过逐行精确匹配验证 + 补丁后 Python 语法校验
+#      （setup.py: @@158/@@360, libpath.py: @@52, cpu_predictor.cc: @@169/@@209）
+#   2. 补丁以 base64 内嵌，运行时解码写入，彻底避免缩进/转义问题
+#   3. dry-run 校验改为下载 PyPI sdist，在 sdist 根目录执行 patch -p1，
+#      与 build-wheel.py 的真实打补丁环境完全一致
+#   4. 版本固定为 1.7.6（补丁按 1.7.6 sdist 精确定制）
 #
 # 产物：Artifacts → xgboost-android-arm64-v8a-cp311
 # ============================================================
@@ -28,10 +26,6 @@ on:
         description: 'Chaquopy Python target 版本（默认 3.11.17-0）'
         required: false
         default: '3.11.17-0'
-      xgboost_version:
-        description: 'XGBoost 版本（默认 1.7.6；可选 1.7.3 / 1.7.4 / 1.7.5 / 1.7.6）'
-        required: false
-        default: '1.7.6'
 concurrency:
   group: build-xgboost-android
   cancel-in-progress: true
@@ -39,10 +33,10 @@ permissions:
   contents: read
 env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
-  XGB_VER: ${{ inputs.xgboost_version || '1.7.6' }}
+  XGB_VER: "1.7.6"
 jobs:
   build:
-    name: xgboost ${{ inputs.xgboost_version || '1.7.6' }} → android_24_arm64_v8a (cp311)
+    name: xgboost 1.7.6 → android_24_arm64_v8a (cp311)
     runs-on: ubuntu-22.04
     timeout-minutes: 180
     steps:
@@ -63,14 +57,14 @@ jobs:
           sed -i 's/ln -s /ln -sf /' build-wheel.py
           echo "=== 补丁后 ==="
           grep -n "ln -sf " build-wheel.py
-      # ---------- 3. 改写 xgboost 配方版本号 ----------
-      - name: Set xgboost recipe version
+      # ---------- 3. 改写 xgboost 配方版本号为 1.7.6 ----------
+      - name: Set xgboost recipe version to 1.7.6
         run: |
           set -e
           cd "$GITHUB_WORKSPACE/chaquopy/server/pypi/packages/xgboost"
           echo "=== 原始 meta.yaml ==="
           cat meta.yaml
-          sed -i -E "s/^(\s*version:\s*).*/\1\"${XGB_VER}\"/" meta.yaml
+          sed -i -E 's/^(\s*version:\s*).*/\1"1.7.6"/' meta.yaml
           if grep -qE '^\s*number:' meta.yaml; then
             sed -i -E 's/^(\s*number:\s*)[0-9]+/\11/' meta.yaml
           else
@@ -78,81 +72,32 @@ jobs:
           fi
           echo "=== 改写后 meta.yaml ==="
           cat meta.yaml
-      # ---------- 4. 按内容重生成 chaquopy.patch（规避行号偏移） ----------
-      - name: Regenerate chaquopy.patch by content matching
+      # ---------- 4. 写入针对 PyPI sdist 1.7.6 精确定制的新补丁（base64 解码） ----------
+      - name: Write chaquopy.patch tailored for PyPI sdist 1.7.6
         run: |
           set -e
           cd "$GITHUB_WORKSPACE/chaquopy/server/pypi/packages/xgboost"
-          echo "=== 原始 patch 大小 ==="
+          python3 -c "import base64; open('patches/chaquopy.patch','wb').write(base64.b64decode('LS0tIHNyYy1vcmlnaW5hbC9zZXR1cC5weQkyMDIwLTA1LTE3IDA4OjI2OjAxLjAwMDAwMDAwMCArMDAwMAorKysgc3JjL3NldHVwLnB5CTIwMjAtMDctMjMgMTc6MTM6MzcuNTkwMzUwMDg2ICswMDAwCkBAIC0xNTgsNyArMTU4LDEzIEBACiAgICAgICAgICAgICByZXR1cm4KIAogICAgICAgICBzcmNfZGlyID0gJ3hnYm9vc3QnCiAgICAgICAgIHRyeToKKyAgICAgICAgICAgICMgQ2hhcXVvcHk6IHRoZSBmaXJzdCBjb3B5X3RyZWUgc2hvdWxkIGZhaWwgd2hlbiBydW5uaW5nIGZyb20gYW4gc2Rpc3QuIEJ1dCB3ZQorICAgICAgICAgICAgIyBoYXBwZW4gdG8gdW5wYWNrIHRoZSBzZGlzdCBpbnRvIGEgZGlyZWN0b3J5IGNhbGxlZCBgc3JjYCwgd2hpY2ggY2F1c2VzIGNvcHlfdHJlZQorICAgICAgICAgICAgIyB0byB0cnkgYW5kIGNvcHkgdGhhdCBkaXJlY3RvcnkgcmVjdXJzaXZlbHkgaW50byBvbmUgb2YgaXRzIG93biBzdWJkaXJlY3RvcmllcywKKyAgICAgICAgICAgICMgd2hpY2ggbmV2ZXIgY29tcGxldGVzLgorICAgICAgICAgICAgcmFpc2UgRXhjZXB0aW9uKCkKKwogICAgICAgICAgICAgY29weV90cmVlKG9zLnBhdGguam9pbihDVVJSRU5UX0RJUiwgb3MucGF0aC5wYXJkaXIpLAogICAgICAgICAgICAgICAgICAgICAgIG9zLnBhdGguam9pbihzZWxmLmJ1aWxkX3RlbXAsIHNyY19kaXIpKQogICAgICAgICBleGNlcHQgRXhjZXB0aW9uOiAgIyBweWxpbnQ6IGRpc2FibGU9YnJvYWQtZXhjZXB0CkBAIC0zNjAsNyArMzYwLDkgQEAKICAgICAgICAgICBtYWludGFpbmVyX2VtYWlsPSdjaG9oeXUwMUBjcy53YXNoaW5ndG9uLmVkdScsCiAgICAgICAgICAgemlwX3NhZmU9RmFsc2UsCiAgICAgICAgICAgcGFja2FnZXM9ZmluZF9wYWNrYWdlcygpLAotICAgICAgICAgIGluY2x1ZGVfcGFja2FnZV9kYXRhPVRydWUsCisgICAgICAgICAgIyBDaGFxdW9weTogd2hlbiBidWlsZGluZyBmcm9tIGFuIHNkaXN0LCBpbmNsdWRlX3BhY2thZ2VfZGF0YSB1bm5lY2Vzc2FyaWx5IGluY2x1ZGVzCisgICAgICAgICAgIyB0aGUgZW50aXJlIG5hdGl2ZSBsaWJyYXJ5IHNvdXJjZSBjb2RlLiBVc2UgcGFja2FnZV9kYXRhIGluc3RlYWQuCisgICAgICAgICAgcGFja2FnZV9kYXRhID0geyJ4Z2Jvb3N0IjogWyJWRVJTSU9OIl19LAogICAgICAgICAgIGxpY2Vuc2U9J0FwYWNoZS0yLjAnLAogICAgICAgICAgIGNsYXNzaWZpZXJzPVsnTGljZW5zZSA6OiBPU0kgQXBwcm92ZWQgOjogQXBhY2hlIFNvZnR3YXJlIExpY2Vuc2UnLAogICAgICAgICAgICAgICAgICAgICAgICAnRGV2ZWxvcG1lbnQgU3RhdHVzIDo6IDUgLSBQcm9kdWN0aW9uL1N0YWJsZScsCi0tLSBzcmMtb3JpZ2luYWwveGdib29zdC9saWJwYXRoLnB5CTIwMjAtMDUtMTcgMDg6MjY6MDEuMDAwMDAwMDAwICswMDAwCisrKyBzcmMveGdib29zdC9saWJwYXRoLnB5CTIwMjAtMDctMjMgMTc6MDc6MjguMzQ1NTgyODMyICswMDAwCkBAIC01Miw3ICs1MiwxMCBAQAogICAgIGlmIHBsYXRmb3JtLnN5c3RlbSgpID09ICdPUzQwMCc6CiAgICAgICAgIGRsbF9wYXRoID0gW29zLnBhdGguam9pbihwLCAnbGlieGdib29zdC5zbycpIGZvciBwIGluIGRsbF9wYXRoXQogCi0gICAgbGliX3BhdGggPSBbcCBmb3IgcCBpbiBkbGxfcGF0aCBpZiBvcy5wYXRoLmV4aXN0cyhwKSBhbmQgb3MucGF0aC5pc2ZpbGUocCldCisgICAgIyBDaGFxdW9weTogY2hlY2tpbmcgd2hldGhlciB0aGUgZmlsZSBleGlzdHMgaXMgcmVkdW5kYW50LCBiZWNhdXNlIGNvcmUuX2xvYWRfbGliIGFscmVhZHkKKyAgICAjIGNhdGNoZXMgT1NFcnJvciBmcm9tIGNkbGwuTG9hZExpYnJhcnksIHdoaWNoIHdlJ3ZlIG1vbmtleS1wYXRjaGVkIHRvIGV4dHJhY3QgdGhlIGxpYnJhcnkKKyAgICAjIG9uIGRlbWFuZC4KKyAgICBsaWJfcGF0aCA9IGRsbF9wYXRoICAjIFdhcyBbcCBmb3IgcCBpbiBkbGxfcGF0aCBpZiBvcy5wYXRoLmV4aXN0cyhwKSBhbmQgb3MucGF0aC5pc2ZpbGUocCldCiAKICAgICAjIFhHQk9PU1RfQlVJTERfRE9DIGlzIGRlZmluZWQgYnkgc3BoaW54IGNvbmYuCiAgICAgaWYgbm90IGxpYl9wYXRoIGFuZCBub3Qgb3MuZW52aXJvbi5nZXQoJ1hHQk9PU1RfQlVJTERfRE9DJywgRmFsc2UpOgotLS0gc3JjLW9yaWdpbmFsL3hnYm9vc3Qvc3JjL3ByZWRpY3Rvci9jcHVfcHJlZGljdG9yLmNjCTIwMjMtMDEtMDYgMTk6MDQ6MDkuMDAwMDAwMDAwICswMDAwCisrKyBzcmMveGdib29zdC9zcmMvcHJlZGljdG9yL2NwdV9wcmVkaWN0b3IuY2MJMjAyMy0wMS0zMCAxMzo1MDozNS41NTAwNjc5ODggKzAwMDAKQEAgLTE2OSw3ICsxNjksNyBAQAogICBTcGFyc2VQYWdlOjpJbnN0IG9wZXJhdG9yW10oc2l6ZV90IHIpIHsKICAgICBhdXRvIHQgPSBvbXBfZ2V0X3RocmVhZF9udW0oKTsKICAgICBhdXRvIGNvbnN0IGJlZyA9IChuX2ZlYXR1cmVzXyAqIGtVbnJvbGwgKiB0KSArIChjdXJyZW50X3Vucm9sbF9bdF0gKiBuX2ZlYXR1cmVzXyk7Ci0gICAgc2l6ZV90IG5vbl9taXNzaW5ne2JlZ307CisgICAgc2l6ZV90IG5vbl9taXNzaW5ne3N0YXRpY19jYXN0PHNpemVfdD4oYmVnKX07ICAvLyBDaGFxdW9weTogaHR0cHM6Ly9naXRodWIuY29tL2RtbGMveGdib29zdC9pc3N1ZXMvODQ4OQogCiAgICAgZm9yIChic3RfZmVhdHVyZV90IGMgPSAwOyBjIDwgbl9mZWF0dXJlc187ICsrYykgewogICAgICAgZmxvYXQgZiA9IHBhZ2VfLkdldEZ2YWx1ZShwdHJzXywgdmFsdWVzXywgbWluc18sIHIsIGMsIGNvbW1vbjo6SXNDYXQoZnRfLCBjKSk7CkBAIC0yMDksNyArMjA5LDcgQEAKICAgICBhdXRvIHJvdyA9IGJhdGNoLkdldExpbmUoaSk7CiAgICAgYXV0byB0ID0gb21wX2dldF90aHJlYWRfbnVtKCk7CiAgICAgYXV0byBjb25zdCBiZWcgPSAoY29sdW1ucyAqIGtVbnJvbGwgKiB0KSArIChjdXJyZW50X3Vucm9sbF9bdF0gKiBjb2x1bW5zKTsKLSAgICBzaXplX3Qgbm9uX21pc3Npbmcge2JlZ307CisgICAgc2l6ZV90IG5vbl9taXNzaW5nIHtzdGF0aWNfY2FzdDxzaXplX3Q+KGJlZyl9OyAgLy8gQ2hhcXVvcHk6IGh0dHBzOi8vZ2l0aHViLmNvbS9kbWxjL3hnYm9vc3QvaXNzdWVzLzg0ODkKICAgICBmb3IgKHNpemVfdCBjID0gMDsgYyA8IHJvdy5TaXplKCk7ICsrYykgewogICAgICAgYXV0byBlID0gcm93LkdldEVsZW1lbnQoYyk7CiAgICAgICBpZiAobWlzc2luZ18gIT0gZS52YWx1ZSAmJiAhY29tbW9uOjpDaGVja05BTihlLnZhbHVlKSkgewo='))"
+          echo "=== 新补丁 hunk headers ==="
+          grep -n "^@@" patches/chaquopy.patch
+          echo "=== 补丁行数 ==="
           wc -l patches/chaquopy.patch
-          python3 - <<'PYEOF'
-          import pathlib, re, sys
-          patch_path = pathlib.Path("patches/chaquopy.patch")
-          src = patch_path.read_text(encoding="utf-8")
-          # 1.7.3 -> 1.7.6 行号偏移映射（基于实测）
-          # setup.py:        121 -> 145,  302 -> 363
-          # libpath.py:       46 ->  55
-          # cpu_predictor.cc:164 -> 172,  204 -> 212
-          offset_map = {
-              "src-original/setup.py": [(121, 145), (302, 363)],
-              "src-original/xgboost/libpath.py": [(46, 55)],
-              "src-original/xgboost/src/predictor/cpu_predictor.cc": [(164, 172), (204, 212)],
-          }
-          lines = src.splitlines(keepends=True)
-          out = []
-          cur_file = None
-          for line in lines:
-              m = re.match(r"^(?:---|\+\+\+)\s+(\S+)", line)
-              if m:
-                  p = m.group(1)
-                  if p in offset_map:
-                      cur_file = p
-                  elif p.startswith("src/"):
-                      # 保持当前文件上下文（+++ 行）
-                      pass
-                  out.append(line)
-                  continue
-              # hunk header: @@ -old_start,old_cnt +new_start,new_cnt @@
-              mh = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$", line.rstrip("\n"))
-              if mh and cur_file:
-                  old_start = int(mh.group(1))
-                  old_cnt = mh.group(2) or "1"
-                  new_start = int(mh.group(3))
-                  new_cnt = mh.group(4) or "1"
-                  tail = mh.group(5)
-                  new_old = old_start
-                  new_new = new_start
-                  for o, n in offset_map[cur_file]:
-                      if old_start == o:
-                          new_old = n
-                          new_new = n
-                          break
-                  out.append(f"@@ -{new_old},{old_cnt} +{new_new},{new_cnt} @@{tail}\n")
-                  continue
-              out.append(line)
-          new_src = "".join(out)
-          patch_path.write_text(new_src, encoding="utf-8")
-          print("=== 重生成完成 ===")
-          print(new_src)
-          PYEOF
-      # ---------- 5. 下载 xgboost 源码并 dry-run 校验补丁 ----------
-      - name: Verify patch applies (dry-run)
+      # ---------- 5. 用 PyPI sdist 做 dry-run 校验（与真实构建同源） ----------
+      - name: Verify patch against PyPI sdist (dry-run)
         run: |
           set -e
           cd /tmp
           rm -rf xgb-verify && mkdir xgb-verify && cd xgb-verify
-          echo "=== 下载 xgboost v${XGB_VER} 源码 ==="
-          curl -fSL --retry 3 -o src.tar.gz "https://github.com/dmlc/xgboost/archive/refs/tags/v${XGB_VER}.tar.gz"
-          tar xzf src.tar.gz
-          SRC_DIR=$(ls -d xgboost-*/ | head -n1)
-          echo "源码目录: $SRC_DIR"
-          # 构造 src-original 结构（patch 的 a/ 侧）
-          rm -rf src-original
-          cp -r "$SRC_DIR" src-original
-          # 复制为 src（patch 的 b/ 侧）
-          rm -rf src
-          cp -r "$SRC_DIR" src
-          echo "=== 应用补丁（--dry-run）==="
+          echo "=== 获取 PyPI sdist 下载地址 ==="
+          SDIST_URL=$(curl -fsSL "https://pypi.org/pypi/xgboost/${XGB_VER}/json" \
+            | python3 -c "import sys,json; print([f['url'] for f in json.load(sys.stdin)['urls'] if f['packagetype']=='sdist'][0])")
+          echo "sdist: $SDIST_URL"
+          curl -fSL --retry 3 -o sdist.tar.gz "$SDIST_URL"
+          tar xzf sdist.tar.gz
+          cd xgboost-${XGB_VER}
+          echo "=== sdist 根目录 ==="
+          ls | head -20
+          echo "=== 应用补丁（--dry-run，与 build-wheel.py 同为 -p1）==="
           patch -p1 --dry-run --fuzz=3 < "$GITHUB_WORKSPACE/chaquopy/server/pypi/packages/xgboost/patches/chaquopy.patch" \
             && echo "✅ PATCH DRY-RUN OK" \
             || { echo "❌ PATCH DRY-RUN FAILED"; exit 1; }
@@ -246,14 +191,14 @@ jobs:
         if: always()
         run: |
           {
-            echo "### xgboost Android wheel 构建摘要（v10 / xgboost ${XGB_VER}）"
+            echo "### xgboost Android wheel 构建摘要（v10c / xgboost 1.7.6）"
             echo ""
             echo "| 项目 | 值 |"
             echo "| --- | --- |"
             echo "| 源码仓库 | chaquo/chaquopy@${{ inputs.chaquopy_ref || 'master' }} |"
             echo "| 构建入口 | server/pypi/build-wheel.py（已打 ln -sf 补丁）|"
-            echo "| 配方 | packages/xgboost（${XGB_VER}）|"
-            echo "| 补丁 | chaquopy.patch（按内容自动重生成）|"
+            echo "| 配方 | packages/xgboost（1.7.6，PyPI sdist）|"
+            echo "| 补丁 | chaquopy.patch（按 1.7.6 sdist 精确定制，base64 内嵌）|"
             echo "| Python target | ${{ inputs.target_version || '3.11.17-0' }}（Maven Central）|"
             echo "| 目标平台 | android_24_arm64_v8a |"
           } >> "$GITHUB_STEP_SUMMARY"
