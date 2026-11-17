@@ -1,0 +1,169 @@
+name: Build ExecuTorch for Android (arm64-v8a AAR)
+# ============================================================
+# 用途：从源码构建 Meta 官方 ExecuTorch 的 Android 运行时库。
+#
+# 产物：executorch.aar —— 包含：
+#   - C++ 运行时 .so（libexecutorch.so，含 XNNPACK 加速）
+#   - Java/Kotlin API（org.pytorch.executorch 包）
+#   - JNI 桥接层
+#
+# 官方构建流程（依据 extension/android/README.md 与
+# scripts/build_android_library.sh）：
+#   1. CMake + NDK 工具链交叉编译 C++ 运行时
+#   2. Gradle 打包成 AAR
+#
+# 关键环境变量：
+#   ANDROID_SDK    Android SDK 路径
+#   ANDROID_NDK    Android NDK 路径
+#   PYTHON_EXECUTABLE  构建期 Python（依赖安装用）
+#   BUILD_AAR_DIR  设置后 AAR 自动拷贝到该目录
+#   EXECUTORCH_BUILD_EXTENSION_LLM  是否包含 LLM 扩展（默认 ON）
+#   EXECUTORCH_CMAKE_BUILD_TYPE     Release / Debug
+# ============================================================
+on:
+  workflow_dispatch:
+    inputs:
+      executorch_ref:
+        description: 'ExecuTorch 分支或 tag'
+        required: false
+        default: 'viable/strict'
+        type: string
+      build_llm:
+        description: '是否包含 LLM 扩展（体积更大）'
+        required: false
+        default: false
+        type: boolean
+      cmake_build_type:
+        description: '构建类型'
+        required: false
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Debug
+  push:
+    paths:
+      - '.github/workflows/build-executorch-android.yml'
+permissions:
+  contents: read
+env:
+  # ExecuTorch 的 Android 构建脚本使用 android-26（API 26），
+  # 因此 NDK 选与官方 CI 一致的较新版本即可
+  ANDROID_NDK_VERSION: "27.2.12479018"
+jobs:
+  build:
+    name: ExecuTorch AAR (${{ inputs.cmake_build_type || 'Release' }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      # ---------- 1. 拉取本仓库（为了拿到 workflow 与说明） ----------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      # ---------- 2. Python 3.11（ExecuTorch 构建工具链依赖） ----------
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # ---------- 3. JDK（Gradle 构建需要） ----------
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      # ---------- 4. Android NDK ----------
+      # ubuntu runner 自带 Android SDK（ANDROID_HOME 已设），补装指定 NDK
+      - name: Setup Android NDK
+        run: |
+          set -euo pipefail
+          ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER=$(find "$ANDROID_HOME" -name sdkmanager -type f | head -1)
+          fi
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "ndk;${ANDROID_NDK_VERSION}" > /dev/null
+          echo "ANDROID_SDK=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK=$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "NDK 安装完成：$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}"
+      # ---------- 5. 拉取 ExecuTorch 源码 ----------
+      - name: Clone ExecuTorch (${{ inputs.executorch_ref || 'viable/strict' }})
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ inputs.executorch_ref || 'viable/strict' }}" \
+            https://github.com/pytorch/executorch.git executorch-src
+          cd executorch-src
+          git submodule update --init --recursive --depth 1
+          echo "已检出：$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)"
+      # ---------- 6. 安装 ExecuTorch 构建依赖 ----------
+      # 官方 install_requirements.sh 会装 PyTorch、torchao 等 pip 依赖
+      - name: Install ExecuTorch build requirements
+        working-directory: executorch-src
+        env:
+          PYTHON_EXECUTABLE: python3
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          # 官方依赖安装脚本（含 PyTorch 与构建工具）
+          bash ./install_requirements.sh --use-pt-pinned-version 2>/dev/null \
+            || bash ./install_requirements.sh
+      # ---------- 7. 构建 AAR（官方脚本） ----------
+      # BUILD_AAR_DIR 设置后，脚本会把产物拷贝为 $BUILD_AAR_DIR/executorch.aar
+      - name: Build executorch.aar (official script)
+        working-directory: executorch-src
+        env:
+          PYTHON_EXECUTABLE: python3
+          ANDROID_SDK: ${{ env.ANDROID_SDK }}
+          ANDROID_NDK: ${{ env.ANDROID_NDK }}
+          BUILD_AAR_DIR: ${{ github.workspace }}/out
+          EXECUTORCH_CMAKE_BUILD_TYPE: ${{ inputs.cmake_build_type || 'Release' }}
+          # LLM 扩展较大，默认关闭；手动触发时可勾选开启
+          EXECUTORCH_BUILD_EXTENSION_LLM: ${{ inputs.build_llm && 'ON' || 'OFF' }}
+          # 只编 arm64-v8a（绝大多数现代手机），如需其它 ABI 再加
+          ANDROID_ABIS: arm64-v8a
+        run: |
+          set -euo pipefail
+          mkdir -p "$BUILD_AAR_DIR"
+          chmod +x scripts/build_android_library.sh
+          sh scripts/build_android_library.sh arm64-v8a
+      # ---------- 8. 收集产物 ----------
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # 官方脚本输出位置一：BUILD_AAR_DIR/executorch.aar
+          # 位置二：extension/android/executorch_android/build/outputs/aar/
+          find executorch-src/extension/android -type f -name "*.aar" \
+            -exec cp -v {} out/ \; || true
+          ls -lh out
+          if ! compgen -G "out/*.aar" > /dev/null; then
+            echo "::error::未找到 AAR 产物"
+            exit 1
+          fi
+      # ---------- 9. 上传产物 ----------
+      - name: Upload AAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: executorch-android-arm64-v8a-${{ inputs.cmake_build_type || 'Release' }}
+          path: out/*.aar
+          if-no-files-found: error
+          retention-days: 30
+      # ---------- 10. 摘要 ----------
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### ExecuTorch Android 构建摘要"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| ExecuTorch | ${{ inputs.executorch_ref || 'viable/strict' }} |"
+            echo "| ABI | arm64-v8a |"
+            echo "| 构建类型 | ${{ inputs.cmake_build_type || 'Release' }} |"
+            echo "| LLM 扩展 | ${{ inputs.build_llm || false }} |"
+            echo "| NDK | ${ANDROID_NDK_VERSION} |"
+            echo ""
+            echo "**产物：**"
+            echo '```'
+            ls -lh out 2>/dev/null || echo "无产物"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
