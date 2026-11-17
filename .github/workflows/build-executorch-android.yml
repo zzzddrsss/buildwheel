@@ -124,7 +124,9 @@ jobs:
           set -euo pipefail
           mkdir -p "$BUILD_AAR_DIR"
           chmod +x scripts/build_android_library.sh
-          sh scripts/build_android_library.sh arm64-v8a
+          # 必须用 bash：脚本使用了 [[ ]] 等 bash 专有语法，
+          # Ubuntu 的 sh 是 dash，不支持这些语法会报 Syntax error
+          bash scripts/build_android_library.sh arm64-v8a
       # ---------- 8. 收集产物 ----------
       - name: Collect artifacts
         run: |
