@@ -9,9 +9,9 @@ name: Export ModernTCN to ExecuTorch .pte
 # 流程：
 #   1. 安装 PyTorch + ExecuTorch
 #   2. 构造 ModernTCN 模型（随机权重或加载 checkpoint）
-#   3. 结构重参数化 → torch.export → ExecuTorch 转换
-#   4. 可选 int8 量化
-#   5. 上传 .pte 产物
+#   3. 结构重参数化 → torch.export → ExecuTorch 转换（XNNPACK）
+#   4. 可选 int8 量化（PT2E + XNNPACKQuantizer）
+#   5. 校验 .pte 产物并上传
 # ============================================================
 on:
   workflow_dispatch:
@@ -31,7 +31,7 @@ on:
       quantize:
         description: '是否导出 int8 量化版本'
         required: false
-        default: false
+        default: true
         type: boolean
   push:
     paths:
@@ -56,18 +56,17 @@ jobs:
         with:
           python-version: "3.11"
       # ---------- 3. 安装依赖 ----------
-      # ExecuTorch 对 PyTorch 版本有严格对应关系，用官方推荐的组合
       - name: Install PyTorch & ExecuTorch
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           # CPU 版 PyTorch（导出不需要 GPU）
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          # ExecuTorch（含 XNNPACK 后端，用于量化）
+          # ExecuTorch（含 XNNPACK 后端）
           python -m pip install executorch
           python -c "import torch, executorch; print('torch', torch.__version__)"
-      # ---------- 4. 导出 .pte ----------
-      - name: Export ModernTCN to .pte
+      # ---------- 4. 导出浮点版 .pte ----------
+      - name: Export ModernTCN to .pte (float)
         run: |
           set -euo pipefail
           mkdir -p out
@@ -82,11 +81,12 @@ jobs:
         run: |
           set -euo pipefail
           python moderntcn/export_pte.py \
-            --output out/moderntcn_int8.pte \
+            --output out/moderntcn.pte \
             --seq-len "${{ inputs.seq_len || 336 }}" \
             --pred-len "${{ inputs.pred_len || 96 }}" \
             --enc-in "${{ inputs.enc_in || 7 }}" \
-            --quantize
+            --quantize \
+            --calib-batches 8
       # ---------- 6. 校验产物 ----------
       - name: Verify .pte files
         run: |
@@ -98,18 +98,7 @@ jobs:
             echo "::error::未生成任何 .pte 文件"
             exit 1
           fi
-          # 校验 .pte 文件头（ExecuTorch 格式魔数）
-          python - <<'PY'
-          import pathlib, sys
-          ptes = sorted(pathlib.Path("out").glob("*.pte"))
-          for p in ptes:
-              data = p.read_bytes()
-              if len(data) < 16:
-                  sys.exit(f"{p.name} 文件过小，疑似损坏")
-              # .pte 以 flatbuffer 标识开头，末尾含 "ET" 魔数
-              print(f"[OK] {p.name}: {len(data)} 字节, 头部={data[:8].hex()}")
-          print(f"[PASS] 共 {len(ptes)} 个 .pte 文件校验通过")
-          PY
+          python moderntcn/verify_pte.py out
       # ---------- 7. 上传产物 ----------
       - name: Upload .pte artifacts
         uses: actions/upload-artifact@v4
