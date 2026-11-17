@@ -1,0 +1,140 @@
+name: Export ModernTCN to ExecuTorch .pte
+# ============================================================
+# 用途：把 ModernTCN（ICLR 2024 时序卷积模型）导出为
+#      ExecuTorch 的 .pte 文件，可直接在 Android 端加载推理。
+#
+# 模型来源：https://github.com/luodhhh/ModernTCN（官方实现）
+# 本仓库 moderntcn/model.py 为其自包含移植版。
+#
+# 流程：
+#   1. 安装 PyTorch + ExecuTorch
+#   2. 构造 ModernTCN 模型（随机权重或加载 checkpoint）
+#   3. 结构重参数化 → torch.export → ExecuTorch 转换
+#   4. 可选 int8 量化
+#   5. 上传 .pte 产物
+# ============================================================
+on:
+  workflow_dispatch:
+    inputs:
+      seq_len:
+        description: '输入序列长度（官方 ETTh1 配置为 336）'
+        required: false
+        default: '336'
+      pred_len:
+        description: '预测长度'
+        required: false
+        default: '96'
+      enc_in:
+        description: '变量数（通道数）'
+        required: false
+        default: '7'
+      quantize:
+        description: '是否导出 int8 量化版本'
+        required: false
+        default: false
+        type: boolean
+  push:
+    paths:
+      - 'moderntcn/**'
+      - '.github/workflows/build-moderntcn-pte.yml'
+permissions:
+  contents: read
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+jobs:
+  export:
+    name: Export .pte (seq${{ inputs.seq_len || 336 }} → pred${{ inputs.pred_len || 96 }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      # ---------- 1. 拉取代码 ----------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      # ---------- 2. Python 3.11 ----------
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # ---------- 3. 安装依赖 ----------
+      # ExecuTorch 对 PyTorch 版本有严格对应关系，用官方推荐的组合
+      - name: Install PyTorch & ExecuTorch
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # CPU 版 PyTorch（导出不需要 GPU）
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          # ExecuTorch（含 XNNPACK 后端，用于量化）
+          python -m pip install executorch
+          python -c "import torch, executorch; print('torch', torch.__version__)"
+      # ---------- 4. 导出 .pte ----------
+      - name: Export ModernTCN to .pte
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python moderntcn/export_pte.py \
+            --output out/moderntcn.pte \
+            --seq-len "${{ inputs.seq_len || 336 }}" \
+            --pred-len "${{ inputs.pred_len || 96 }}" \
+            --enc-in "${{ inputs.enc_in || 7 }}"
+      # ---------- 5. 可选：int8 量化版 ----------
+      - name: Export quantized .pte (int8)
+        if: ${{ inputs.quantize }}
+        run: |
+          set -euo pipefail
+          python moderntcn/export_pte.py \
+            --output out/moderntcn_int8.pte \
+            --seq-len "${{ inputs.seq_len || 336 }}" \
+            --pred-len "${{ inputs.pred_len || 96 }}" \
+            --enc-in "${{ inputs.enc_in || 7 }}" \
+            --quantize
+      # ---------- 6. 校验产物 ----------
+      - name: Verify .pte files
+        run: |
+          set -euo pipefail
+          echo "=== 产物列表 ==="
+          ls -lh out
+          COUNT=$(ls -1 out/*.pte 2>/dev/null | wc -l)
+          if [ "$COUNT" -lt 1 ]; then
+            echo "::error::未生成任何 .pte 文件"
+            exit 1
+          fi
+          # 校验 .pte 文件头（ExecuTorch 格式魔数）
+          python - <<'PY'
+          import pathlib, sys
+          ptes = sorted(pathlib.Path("out").glob("*.pte"))
+          for p in ptes:
+              data = p.read_bytes()
+              if len(data) < 16:
+                  sys.exit(f"{p.name} 文件过小，疑似损坏")
+              # .pte 以 flatbuffer 标识开头，末尾含 "ET" 魔数
+              print(f"[OK] {p.name}: {len(data)} 字节, 头部={data[:8].hex()}")
+          print(f"[PASS] 共 {len(ptes)} 个 .pte 文件校验通过")
+          PY
+      # ---------- 7. 上传产物 ----------
+      - name: Upload .pte artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: moderntcn-pte-seq${{ inputs.seq_len || 336 }}-pred${{ inputs.pred_len || 96 }}
+          path: out/*.pte
+          if-no-files-found: error
+          retention-days: 30
+      # ---------- 8. 摘要 ----------
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### ModernTCN → ExecuTorch .pte 导出摘要"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 模型 | ModernTCN (ICLR 2024) |"
+            echo "| 输入长度 | ${{ inputs.seq_len || 336 }} |"
+            echo "| 预测长度 | ${{ inputs.pred_len || 96 }} |"
+            echo "| 变量数 | ${{ inputs.enc_in || 7 }} |"
+            echo "| int8 量化 | ${{ inputs.quantize || false }} |"
+            echo ""
+            echo "**产物：**"
+            echo '```'
+            ls -lh out 2>/dev/null || echo "无产物"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
